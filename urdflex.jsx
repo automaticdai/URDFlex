@@ -102,8 +102,8 @@ function parseURDF(xml) {
         if (parsed.geometry) {
           if (parsed.geometry.type === "mesh") {
             hasMeshes = true;
-            const r = mass > 0 ? Math.max(0.015, Math.min(0.08, Math.cbrt(mass / 1000) * 0.3)) : 0.025;
-            parsed.geometry = { type: "sphere", radius: r, isMeshPlaceholder: true };
+            // Small uniform joint dot — skeleton style
+            parsed.geometry = { type: "sphere", radius: 0.012, isMeshPlaceholder: true };
           }
           visuals.push(parsed);
         }
@@ -116,8 +116,7 @@ function parseURDF(xml) {
         const parsed = parseVisual(c, materialMap); // same structure as visual
         if (parsed.geometry) {
           if (parsed.geometry.type === "mesh") {
-            const r = mass > 0 ? Math.max(0.015, Math.min(0.06, Math.cbrt(mass / 1000) * 0.25)) : 0.02;
-            parsed.geometry = { type: "sphere", radius: r };
+            parsed.geometry = { type: "sphere", radius: 0.015 };
           }
           collisions.push(parsed);
         }
@@ -1355,9 +1354,9 @@ function Viewport({ parsedData, selectedLink, onSelectLink, jointValues, display
           const isPlaceholder = vis.geometry.isMeshPlaceholder;
 
           if (isPlaceholder) {
+            // Solid joint dot — skeleton style
             const mat = new THREE.MeshBasicMaterial({
-              color: new THREE.Color(col[0], col[1], col[2]),
-              transparent: true, opacity: 0.15, depthWrite: false,
+              color: new THREE.Color(col[0] * 0.5 + 0.5, col[1] * 0.5 + 0.5, col[2] * 0.5 + 0.5),
             });
             const mesh = new THREE.Mesh(geom, mat);
             mesh.userData.linkName = l.name;
@@ -1366,13 +1365,15 @@ function Viewport({ parsedData, selectedLink, onSelectLink, jointValues, display
               mesh.rotation.set(vis.origin.rpy[0], vis.origin.rpy[1], vis.origin.rpy[2], "XYZ");
             }
             visualGroup.add(mesh);
-            const wire = new THREE.LineSegments(
-              new THREE.EdgesGeometry(geom),
-              new THREE.LineBasicMaterial({ color: new THREE.Color(col[0], col[1], col[2]), transparent: true, opacity: 0.6 })
-            );
-            wire.position.copy(mesh.position);
-            wire.rotation.copy(mesh.rotation);
-            visualGroup.add(wire);
+            // Outer glow ring
+            const glowGeo = new THREE.SphereGeometry(0.018, 16, 10);
+            const glowMat = new THREE.MeshBasicMaterial({
+              color: new THREE.Color(col[0], col[1], col[2]),
+              transparent: true, opacity: 0.12, depthWrite: false,
+            });
+            const glow = new THREE.Mesh(glowGeo, glowMat);
+            glow.position.copy(mesh.position);
+            visualGroup.add(glow);
           } else {
             const mat = new THREE.MeshStandardMaterial({
               color: new THREE.Color(col[0], col[1], col[2]),
@@ -1436,16 +1437,18 @@ function Viewport({ parsedData, selectedLink, onSelectLink, jointValues, display
         }
       });
 
-      // Origin axes sub-group
-      const originGroup = new THREE.Group();
-      originGroup.userData.role = "origin";
-      group.add(originGroup);
+      // Origin axes sub-group (only for links with visuals)
+      if ((l.visuals || []).length > 0) {
+        const originGroup = new THREE.Group();
+        originGroup.userData.role = "origin";
+        group.add(originGroup);
 
-      const axLen = 0.05;
-      [{ dir: [axLen, 0, 0], color: 0xff4444 }, { dir: [0, axLen, 0], color: 0x44ff44 }, { dir: [0, 0, axLen], color: 0x4444ff }].forEach(({ dir, color }) => {
-        const pts = [new THREE.Vector3(0, 0, 0), new THREE.Vector3(...dir)];
-        originGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5 })));
-      });
+        const axLen = 0.025;
+        [{ dir: [axLen, 0, 0], color: 0xff4444 }, { dir: [0, axLen, 0], color: 0x44ff44 }, { dir: [0, 0, axLen], color: 0x4444ff }].forEach(({ dir, color }) => {
+          const pts = [new THREE.Vector3(0, 0, 0), new THREE.Vector3(...dir)];
+          originGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5 })));
+        });
+      }
     });
 
     // Assemble kinematic chain with default (zero) transforms
@@ -1466,14 +1469,31 @@ function Viewport({ parsedData, selectedLink, onSelectLink, jointValues, display
           childGroup, parentGroup,
         });
 
-        // Static connector line
+        // Bone segment — cylinder connecting parent origin to child origin
+        // Skip bones to empty links (sensors, IMUs) that have no visual geometry
+        const childLinkData = links.find((l) => l.name === j.child);
+        const childHasVisuals = childLinkData && childLinkData.visuals && childLinkData.visuals.length > 0;
         const jColor = JOINT_COLORS[j.type] ? parseInt(JOINT_COLORS[j.type].replace("#", ""), 16) : 0x64748b;
-        const len = new THREE.Vector3(j.origin.xyz[0], j.origin.xyz[1], j.origin.xyz[2]).length();
-        if (len > 0.001) {
-          const connGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(j.origin.xyz[0], j.origin.xyz[1], j.origin.xyz[2])]);
-          const connLine = new THREE.Line(connGeo, new THREE.LineDashedMaterial({ color: jColor, transparent: true, opacity: 0.3, dashSize: 0.03, gapSize: 0.015 }));
-          connLine.computeLineDistances();
-          parentGroup.add(connLine);
+        const originVec = new THREE.Vector3(j.origin.xyz[0], j.origin.xyz[1], j.origin.xyz[2]);
+        const len = originVec.length();
+        if (len > 0.001 && childHasVisuals) {
+          const boneRadius = j.type === "fixed" ? 0.002 : 0.004;
+          const boneOpacity = j.type === "fixed" ? 0.35 : 0.7;
+          const boneGeo = new THREE.CylinderGeometry(boneRadius, boneRadius * 0.6, len, 6);
+          boneGeo.translate(0, len / 2, 0);
+          boneGeo.rotateX(Math.PI / 2);
+          const boneMat = new THREE.MeshBasicMaterial({ color: jColor, transparent: true, opacity: boneOpacity });
+          const bone = new THREE.Mesh(boneGeo, boneMat);
+          bone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), originVec.clone().normalize());
+          bone.userData.role = "bone";
+          parentGroup.add(bone);
+
+          // Thin glow line alongside bone
+          const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), originVec]);
+          const lineMat = new THREE.LineBasicMaterial({ color: jColor, transparent: true, opacity: 0.15 });
+          const line = new THREE.Line(lineGeo, lineMat);
+          line.userData.role = "bone";
+          parentGroup.add(line);
         }
       }
     });
@@ -1506,7 +1526,7 @@ function Viewport({ parsedData, selectedLink, onSelectLink, jointValues, display
       bbox.getCenter(center);
       bbox.getSize(size);
       orbitRef.current.target.copy(center);
-      orbitRef.current.distance = Math.max(Math.max(size.x, size.y, size.z) * 2, 1.5);
+      orbitRef.current.distance = Math.max(Math.max(size.x, size.y, size.z) * 2.5, 1.5);
     }
   }, [parsedData]); // ← NO jointValues here
 
@@ -1565,14 +1585,14 @@ function Viewport({ parsedData, selectedLink, onSelectLink, jointValues, display
       mg.quaternion.copy(robotWQ.clone().invert().multiply(parentWQ));
 
       if (type === "revolute" || type === "continuous") {
-        const ringRadius = 0.3;
+        const ringRadius = 0.06;
         const axVec = new THREE.Vector3(...jAxis).normalize();
         const colorObj = new THREE.Color(jColor);
         const ringQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), axVec);
 
         // Torus ring
         const torus = new THREE.Mesh(
-          new THREE.TorusGeometry(ringRadius, 0.008, 8, 64),
+          new THREE.TorusGeometry(ringRadius, 0.003, 8, 48),
           new THREE.MeshBasicMaterial({ color: colorObj, transparent: true, opacity: 0.85 })
         );
         torus.quaternion.copy(ringQuat);
@@ -1604,8 +1624,8 @@ function Viewport({ parsedData, selectedLink, onSelectLink, jointValues, display
 
         // Arrow cone at current angle
         const arrowAngle = jVal || 0;
-        const coneGeo = new THREE.ConeGeometry(0.02, 0.06, 8);
-        coneGeo.translate(0, 0.03, 0);
+        const coneGeo = new THREE.ConeGeometry(0.008, 0.024, 8);
+        coneGeo.translate(0, 0.012, 0);
         coneGeo.rotateZ(-Math.PI / 2);
         const cone = new THREE.Mesh(coneGeo, new THREE.MeshBasicMaterial({ color: 0xffffff }));
         cone.position.set(Math.cos(arrowAngle) * ringRadius, Math.sin(arrowAngle) * ringRadius, 0);
@@ -1624,9 +1644,9 @@ function Viewport({ parsedData, selectedLink, onSelectLink, jointValues, display
         mg.add(refLine);
 
         // Center dot + axis line
-        mg.add(new THREE.Mesh(new THREE.SphereGeometry(0.025, 12, 8), new THREE.MeshBasicMaterial({ color: colorObj })));
+        mg.add(new THREE.Mesh(new THREE.SphereGeometry(0.008, 12, 8), new THREE.MeshBasicMaterial({ color: colorObj })));
         mg.add(new THREE.Line(
-          new THREE.BufferGeometry().setFromPoints([axVec.clone().multiplyScalar(-0.15), axVec.clone().multiplyScalar(0.15)]),
+          new THREE.BufferGeometry().setFromPoints([axVec.clone().multiplyScalar(-0.04), axVec.clone().multiplyScalar(0.04)]),
           new THREE.LineBasicMaterial({ color: jColor, transparent: true, opacity: 0.5 })
         ));
       }
@@ -1634,16 +1654,16 @@ function Viewport({ parsedData, selectedLink, onSelectLink, jointValues, display
       if (type === "prismatic") {
         const axVec = new THREE.Vector3(...jAxis).normalize();
         mg.add(new THREE.Line(
-          new THREE.BufferGeometry().setFromPoints([axVec.clone().multiplyScalar(-0.25), axVec.clone().multiplyScalar(0.25)]),
+          new THREE.BufferGeometry().setFromPoints([axVec.clone().multiplyScalar(-0.06), axVec.clone().multiplyScalar(0.06)]),
           new THREE.LineBasicMaterial({ color: jColor, transparent: true, opacity: 0.7 })
         ));
-        const cGeo = new THREE.ConeGeometry(0.02, 0.06, 8);
-        cGeo.translate(0, 0.03, 0);
+        const cGeo = new THREE.ConeGeometry(0.008, 0.024, 8);
+        cGeo.translate(0, 0.012, 0);
         const cMesh = new THREE.Mesh(cGeo, new THREE.MeshBasicMaterial({ color: jColor }));
-        cMesh.position.copy(axVec.clone().multiplyScalar(0.25));
+        cMesh.position.copy(axVec.clone().multiplyScalar(0.06));
         cMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), axVec);
         mg.add(cMesh);
-        mg.add(new THREE.Mesh(new THREE.SphereGeometry(0.025, 12, 8), new THREE.MeshBasicMaterial({ color: jColor })));
+        mg.add(new THREE.Mesh(new THREE.SphereGeometry(0.008, 12, 8), new THREE.MeshBasicMaterial({ color: jColor })));
       }
 
       mGroup.add(mg);
@@ -1796,19 +1816,101 @@ function Viewport({ parsedData, selectedLink, onSelectLink, jointValues, display
 
   return <div ref={containerRef} style={{ width: "100%", height: "100%", cursor: "grab" }} />;
 }
+function highlightXML(code) {
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const S = {
+    com: "color:#546e7a;font-style:italic", // comments
+    pi: "color:#82aaff",   // <?xml?>
+    tag: "color:#f07178",  // tag names
+    br: "color:#89ddff",   // < > / =
+    attr: "color:#ffcb6b", // attribute names
+    val: "color:#c3e88d",  // "values"
+  };
+  const sp = (cls, txt) => `<span style="${S[cls]}">${txt}</span>`;
+  let out = "", i = 0, src = code;
+  while (i < src.length) {
+    // Comment
+    if (src.startsWith("<!--", i)) {
+      const end = src.indexOf("-->", i + 4);
+      const j = end < 0 ? src.length : end + 3;
+      out += sp("com", esc(src.slice(i, j)));
+      i = j; continue;
+    }
+    // Processing instruction
+    if (src.startsWith("<?", i)) {
+      const end = src.indexOf("?>", i + 2);
+      const j = end < 0 ? src.length : end + 2;
+      out += sp("pi", esc(src.slice(i, j)));
+      i = j; continue;
+    }
+    // Opening or closing tag
+    if (src[i] === "<") {
+      let j = i + 1, closing = false;
+      if (src[j] === "/") { closing = true; j++; }
+      // Tag name
+      let tagName = "";
+      while (j < src.length && /[\w:.\-]/.test(src[j])) { tagName += src[j]; j++; }
+      out += sp("br", esc(closing ? "</" : "<")) + (tagName ? sp("tag", esc(tagName)) : "");
+      // Attributes until >
+      while (j < src.length && src[j] !== ">") {
+        if (/\s/.test(src[j])) { out += esc(src[j]); j++; continue; }
+        // Self-closing slash
+        if (src[j] === "/" && j + 1 < src.length && src[j + 1] === ">") { break; }
+        // Attribute name
+        let aName = "";
+        while (j < src.length && /[\w:.\-]/.test(src[j])) { aName += src[j]; j++; }
+        if (aName) out += sp("attr", esc(aName));
+        // =
+        if (j < src.length && src[j] === "=") { out += sp("br", "="); j++; }
+        // Quoted value (double or single)
+        if (j < src.length && (src[j] === '"' || src[j] === "'")) {
+          const q = src[j];
+          let val = q; j++;
+          while (j < src.length && src[j] !== q) { val += src[j]; j++; }
+          if (j < src.length) { val += q; j++; }
+          out += sp("val", esc(val));
+          continue;
+        }
+        // Fallback: emit any unrecognized character and advance
+        if (!aName) { out += esc(src[j]); j++; }
+      }
+      // Close: /> or >
+      if (j < src.length && src[j] === "/" && j + 1 < src.length && src[j + 1] === ">") {
+        out += sp("br", "/&gt;"); j += 2;
+      } else if (j < src.length && src[j] === ">") {
+        out += sp("br", "&gt;"); j++;
+      }
+      i = j; continue;
+    }
+    // Plain text
+    out += esc(src[i]); i++;
+  }
+  return out;
+}
+
 function CodeEditor({ code, onChange }) {
   const textareaRef = useRef(null);
   const lineCountRef = useRef(null);
+  const highlightRef = useRef(null);
   const lineCount = useMemo(() => code.split("\n").length, [code]);
-  const syncScroll = () => { if (textareaRef.current && lineCountRef.current) lineCountRef.current.scrollTop = textareaRef.current.scrollTop; };
+  const highlighted = useMemo(() => highlightXML(code), [code]);
+  const syncScroll = () => {
+    const t = textareaRef.current;
+    if (t && lineCountRef.current) lineCountRef.current.scrollTop = t.scrollTop;
+    if (t && highlightRef.current) { highlightRef.current.scrollTop = t.scrollTop; highlightRef.current.scrollLeft = t.scrollLeft; }
+  };
 
   return (
     <div style={{ display: "flex", height: "100%", background: "#0b0e14", fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>
       <div ref={lineCountRef} style={{ width: 44, padding: "12px 8px 12px 0", textAlign: "right", fontSize: 11, lineHeight: "18px", color: "#334155", userSelect: "none", overflow: "hidden", borderRight: "1px solid #1e293b", flexShrink: 0 }}>
         {Array.from({ length: lineCount }, (_, i) => <div key={i}>{i + 1}</div>)}
       </div>
-      <textarea ref={textareaRef} value={code} onChange={(e) => onChange(e.target.value)} onScroll={syncScroll} spellCheck={false}
-        style={{ flex: 1, background: "transparent", color: "#cbd5e1", border: "none", outline: "none", resize: "none", padding: "12px", fontSize: 12, lineHeight: "18px", fontFamily: "inherit", tabSize: 2, whiteSpace: "pre", overflowWrap: "normal", overflowX: "auto" }} />
+      <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+        <pre ref={highlightRef} aria-hidden="true" dangerouslySetInnerHTML={{ __html: highlighted + "\n" }}
+          style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, margin: 0, padding: "12px", fontSize: 12, lineHeight: "18px", fontFamily: "inherit", whiteSpace: "pre", overflowWrap: "normal", overflow: "auto", color: "#cbd5e1", pointerEvents: "none", tabSize: 2 }} />
+        <textarea ref={textareaRef} value={code} onChange={(e) => onChange(e.target.value)} onScroll={syncScroll} spellCheck={false}
+          style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", background: "transparent", color: "transparent", caretColor: "#e2e8f0", border: "none", outline: "none", resize: "none", padding: "12px", fontSize: 12, lineHeight: "18px", fontFamily: "inherit", tabSize: 2, whiteSpace: "pre", overflowWrap: "normal", overflow: "auto", zIndex: 1 }} />
+      </div>
     </div>
   );
 }
@@ -2071,6 +2173,15 @@ function ConnectionGraph({ parsedData, selectedLink, onSelectLink }) {
 // ─── Main App (3-column: left panel | viewport | graph + code) ─
 export default function URDFEditor() {
   const [code, setCode] = useState(DEFAULT_URDF);
+  const fileInputRef = useRef(null);
+  const loadFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => { setCode(ev.target.result); setJointValues({}); setActiveJoint(null); };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
   const [parsedData, setParsedData] = useState(null);
   const [selectedLink, setSelectedLink] = useState(null);
   const [tree, setTree] = useState([]);
@@ -2140,7 +2251,7 @@ export default function URDFEditor() {
           </div>
           {parsedData && !parsedData.error && <div style={{ fontSize: 11, color: "#64748b" }}>{parsedData.name} — {parsedData.links.length} links, {parsedData.joints.length} joints</div>}
           {parsedData?.error && <div style={{ fontSize: 11, color: "#ef4444", marginTop: 4, lineHeight: 1.3 }}>⚠ {parsedData.error.slice(0, 120)}</div>}
-          {parsedData?.hasMeshes && <div style={{ fontSize: 10, color: "#f59e0b", marginTop: 4, lineHeight: 1.3, background: "#78350f22", padding: "4px 6px", borderRadius: 3 }}>⚠ STL meshes shown as placeholders — kinematics & joints still functional</div>}
+          {parsedData?.hasMeshes && <div style={{ fontSize: 10, color: "#f59e0b", marginTop: 4, lineHeight: 1.3, background: "#78350f22", padding: "4px 6px", borderRadius: 3 }}>⚠ STL meshes shown as skeleton — kinematics & joints fully functional</div>}
         </div>
 
         <div style={{ display: "flex", borderBottom: "1px solid #1e293b" }}>
@@ -2287,6 +2398,18 @@ export default function URDFEditor() {
             <span style={{ fontSize: 10, color: "#38bdf8" }}>{"<>"}</span>
             <span style={{ fontSize: 11, color: "#64748b" }}>URDF Source</span>
             <div style={{ flex: 1 }} />
+            <input ref={fileInputRef} type="file" accept=".urdf,.xml,.xacro" onChange={loadFile} style={{ display: "none" }} />
+            <button onClick={() => fileInputRef.current?.click()} style={{ padding: "2px 7px", background: "#1e293b", border: "1px solid #334155", borderRadius: 3, color: "#94a3b8", fontSize: 10, cursor: "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", gap: 3, lineHeight: 1 }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "#334155"; e.currentTarget.style.color = "#e2e8f0"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "#1e293b"; e.currentTarget.style.color = "#94a3b8"; }}>
+              📂 Load
+            </button>
+            <button onClick={() => { const blob = new Blob([code], { type: "text/xml" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = (parsedData?.name || "robot") + ".urdf"; a.click(); URL.revokeObjectURL(url); }}
+              style={{ padding: "2px 7px", background: "#1e293b", border: "1px solid #334155", borderRadius: 3, color: "#94a3b8", fontSize: 10, cursor: "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", gap: 3, lineHeight: 1 }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "#334155"; e.currentTarget.style.color = "#e2e8f0"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "#1e293b"; e.currentTarget.style.color = "#94a3b8"; }}>
+              💾 Save
+            </button>
             <span style={{ fontSize: 10, color: "#334155" }}>{code.split("\n").length} lines</span>
           </div>
           <div style={{ flex: 1, minHeight: 0 }}>
